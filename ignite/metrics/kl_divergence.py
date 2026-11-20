@@ -3,7 +3,7 @@ from collections.abc import Sequence
 import torch
 import torch.nn.functional as F
 from packaging.version import Version
-
+import torch.nn.functional as F
 from ignite.exceptions import NotComputableError
 from ignite.metrics.metric import Metric, reinit__is_reduced, sync_all_reduce
 
@@ -99,21 +99,47 @@ class KLDivergence(Metric):
         self._update(y_pred, y)
 
     def _update(self, y_pred: torch.Tensor, y: torch.Tensor) -> None:
-        y_pred = F.log_softmax(y_pred, dim=1)
+    # Perform KL divergence calculations in FP32 to avoid
+    # overflow and precision loss with half-precision inputs.
+    y_pred = y_pred.float()
+    y = y.float()
 
-        if TORCH_VERSION_GE_160:
-            # log_target option can be used from 1.6.0
-            y = F.log_softmax(y, dim=1)
-            kl_sum = F.kl_div(y_pred, y, log_target=True, reduction="sum")
-        else:
-            # y is expected to be a probability tensor
-            y = F.softmax(y, dim=1)
-            kl_sum = F.kl_div(y_pred, y, reduction="sum")
+    y_pred = F.log_softmax(y_pred, dim=1)
 
-        self._sum_of_kl += kl_sum.to(self._device)
+    if TORCH_VERSION_GE_160:
+        # log_target option can be used from 1.6.0
+        y = F.log_softmax(y, dim=1)
+        kl_sum = F.kl_div(y_pred, y, log_target=True, reduction="sum")
+    else:
+        # y is expected to be a probability tensor
+        y = F.softmax(y, dim=1)
+        kl_sum = F.kl_div(y_pred, y, reduction="sum")
+
+    self._sum_of_kl += kl_sum.to(self._device)
 
     @sync_all_reduce("_sum_of_kl", "_num_examples")
     def compute(self) -> float:
         if self._num_examples == 0:
             raise NotComputableError("KLDivergence must have at least one example before it can be computed.")
         return self._sum_of_kl.item() / self._num_examples
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_precision_inputs(dtype):
+    torch.manual_seed(42)
+
+    y_pred = torch.randn(200_000, 2, dtype=dtype)
+    y = torch.randn(200_000, 2, dtype=dtype)
+
+    expected = F.kl_div(
+        F.log_softmax(y_pred.float(), dim=1),
+        F.log_softmax(y.float(), dim=1),
+        log_target=True,
+        reduction="sum",
+    ).item() / y_pred.shape[0]
+
+    metric = KLDivergence()
+    metric.update((y_pred, y))
+
+    result = metric.compute()
+
+    assert np.isfinite(result)
+    assert result == pytest.approx(expected, rel=1e-5)
